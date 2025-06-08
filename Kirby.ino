@@ -46,6 +46,7 @@ Preferences prefs;
 
 RTC_DATA_ATTR int readingCnt = -1;
 RTC_DATA_ATTR int arrayCnt = 0;
+RTC_DATA_ATTR bool firstRun = true;
 volatile bool relayReady = false;
 int i;
 
@@ -58,7 +59,7 @@ typedef struct {
 } sensorReadings;
 
 #define maximumReadings 360 // The maximum number of readings that can be stored in the available space
-#define sleeptimeSecs   1
+#define sleeptimeSecs   30
 #define WIFI_TIMEOUT 20000
 #define TIME_TIMEOUT 20000
 RTC_DATA_ATTR sensorReadings Readings[maximumReadings];
@@ -68,16 +69,175 @@ int hours, mins, secs;
 float tempC;
 bool sent = false;
 
-//IPAddress PGIP(192,168,50,197);        // your PostgreSQL server IP 
-
-
-
 
 
 uint8_t relayMAC[] = {0xC0, 0x49, 0xEF, 0x93, 0xA9, 0xFC}; // MAC address of the relay device
 
 volatile bool gotAck = false;
 volatile bool awaitingAck = false;
+
+
+// Packet structure for ESP-NOW
+typedef struct {
+  uint8_t msgType;    // 0=data, 1=start, 2=end, 3=ack, 4=time_request, 5=time_response
+  uint16_t packetId;  // Packet sequence number
+  uint16_t totalPackets;
+  uint16_t dataSize;  // Actual data bytes in this packet
+  uint8_t data[240]; // Max ESP-NOW payload is ~250 bytes
+} espnow_packet_t;
+
+// Global variables
+ bool needTimeSync = true;
+RTC_DATA_ATTR unsigned long lastTimeSync = 0;
+volatile bool ackReceived = false;
+volatile bool timeReceived = false;
+volatile unsigned long receivedTime = 0;
+unsigned long ackTimeout = 1000; // 1 second timeout
+unsigned long timeTimeout = 3000; // 3 second timeout for time sync
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Called when packet is sent
+}
+
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
+  espnow_packet_t packet;
+  memcpy(&packet, incomingData, sizeof(packet));
+  
+  if (packet.msgType == 3) { // ACK
+    ackReceived = true;
+  } else if (packet.msgType == 5) { // Time response
+    memcpy((void*)&receivedTime, packet.data, sizeof(unsigned long));
+    timeReceived = true;
+  }
+}
+
+bool sendPacketWithRetry(espnow_packet_t* packet, int maxRetries = 3) {
+  for (int retry = 0; retry < maxRetries; retry++) {
+    ackReceived = false;
+    
+    esp_err_t result = esp_now_send(relayMAC, (uint8_t*)packet, sizeof(espnow_packet_t));
+    if (result != ESP_OK) {
+      delay(100);
+      continue;
+    }
+    
+    // Wait for ACK
+    unsigned long startTime = millis();
+    while (!ackReceived && (millis() - startTime) < ackTimeout) {
+      delay(10);
+    }
+    
+    if (ackReceived) {
+      return true;
+    }
+    
+    delay(100 * (retry + 1)); // Exponential backoff
+  }
+  return false;
+}
+
+bool requestTimeSync() {
+  espnow_packet_t timeRequest;
+  timeRequest.msgType = 4; // Time request
+  timeRequest.packetId = 0;
+  timeRequest.totalPackets = 0;
+  timeRequest.dataSize = 0;
+  
+  timeReceived = false;
+  
+  for (int retry = 0; retry < 3; retry++) {
+    esp_err_t result = esp_now_send(relayMAC, (uint8_t*)&timeRequest, sizeof(espnow_packet_t));
+    if (result != ESP_OK) {
+      delay(200);
+      continue;
+    }
+    
+    unsigned long startTime = millis();
+    while (!timeReceived && (millis() - startTime) < timeTimeout) {
+      delay(50);
+    }
+    
+    if (timeReceived) {
+      // Update RTC or system time here if needed
+      lastTimeSync = millis();
+      needTimeSync = false;
+
+      struct timeval now = {
+        .tv_sec = receivedTime,
+        .tv_usec = 0
+      };
+      settimeofday(&now, nullptr);
+
+      Serial.print("Time set from relay: ");
+      Serial.println(receivedTime);
+
+      return true;
+    }
+    
+    delay(500);
+  }
+  
+  Serial.println("Time sync failed");
+  return false;
+}
+
+bool transmitReadingsArray() {
+  const int maxDataPerPacket = 240;
+  const int totalDataSize = sizeof(Readings);
+  const int totalPackets = (totalDataSize + maxDataPerPacket - 1) / maxDataPerPacket;
+  
+  Serial.println("Starting transmission of " + String(totalDataSize) + " bytes in " + String(totalPackets) + " packets");
+  
+  // Send start packet
+  espnow_packet_t startPacket;
+  startPacket.msgType = 1; // Start
+  startPacket.packetId = 0;
+  startPacket.totalPackets = totalPackets;
+  startPacket.dataSize = totalDataSize;
+  
+  if (!sendPacketWithRetry(&startPacket)) {
+    Serial.println("Failed to send start packet");
+    return false;
+  }
+  
+  // Send data packets
+  uint8_t* dataPtr = (uint8_t*)&Readings;
+  for (int i = 0; i < totalPackets; i++) {
+    espnow_packet_t dataPacket;
+    dataPacket.msgType = 0; // Data
+    dataPacket.packetId = i + 1;
+    dataPacket.totalPackets = totalPackets;
+    
+    int remainingBytes = totalDataSize - (i * maxDataPerPacket);
+    int bytesToSend = min(remainingBytes, maxDataPerPacket);
+    dataPacket.dataSize = bytesToSend;
+    
+    memcpy(dataPacket.data, dataPtr + (i * maxDataPerPacket), bytesToSend);
+    
+    if (!sendPacketWithRetry(&dataPacket)) {
+      Serial.println("Failed to send data packet " + String(i + 1));
+      return false;
+    }
+    
+    Serial.println("Sent packet " + String(i + 1) + "/" + String(totalPackets));
+    delay(50); // Small delay between packets
+  }
+  
+  // Send end packet
+  espnow_packet_t endPacket;
+  endPacket.msgType = 2; // End
+  endPacket.packetId = totalPackets + 1;
+  endPacket.totalPackets = totalPackets;
+  endPacket.dataSize = 0;
+  
+  if (!sendPacketWithRetry(&endPacket)) {
+    Serial.println("Failed to send end packet");
+    return false;
+  }
+  
+  Serial.println("Transmission completed successfully");
+  return true;
+}
 
 void initESPNOW() {
   // Initialize ESP-NOW
@@ -87,6 +247,7 @@ void initESPNOW() {
     Serial.println("ESP-NOW init failed");
     return;
   }
+  esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
 
   // Register peer (relay MAC must be known ahead of time)
@@ -95,140 +256,6 @@ void initESPNOW() {
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
   esp_now_add_peer(&peerInfo);
-}
-
-bool sendDataBatched(sensorReadings* data, int count) {
-  uint8_t packetBuffer[BATCH_SIZE * sizeof(sensorReadings)];
-  uint8_t batchNum = 0;
-
-  for (int i = 0; i < count; i += BATCH_SIZE) {
-    int batchLen = min(BATCH_SIZE, count - i);
-    memcpy(packetBuffer, &data[i], batchLen * sizeof(sensorReadings));
-
-    int retries = 0;
-    bool acked = false;
-    while (retries < 3 && !acked) {
-      gotBatchAck = false;
-
-      // Send batch with batch number as the last byte
-      esp_err_t result = esp_now_send(relayMAC, packetBuffer, batchLen * sizeof(sensorReadings));
-      if (result != ESP_OK) {
-        Serial.println("esp_now_send failed!");
-        retries++;
-        delay(10);
-        continue;
-      }
-
-      // Wait for ACK for this batch
-      unsigned long start = millis();
-      while ((!gotBatchAck || lastAckBatch != batchNum) && (millis() - start < 1000)) {
-        delay(1);
-      }
-      if (gotBatchAck && lastAckBatch == batchNum) {
-        acked = true;
-      } else {
-        Serial.print("Timeout waiting for batch ACK ");
-        Serial.println(batchNum);
-        retries++;
-        delay(10);
-      }
-    }
-    if (!acked) {
-      Serial.print("Failed to send batch ");
-      Serial.println(batchNum);
-      return false;
-    }
-    batchNum++;
-  }
-  return true;
-}
-
-// Handshake response callback
-void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-  Serial.print("Received something! Length: ");
-  Serial.println(len);
-  for (int i = 0; i < len; i++) {
-    Serial.print(incomingData[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
-
-  if (len == sizeof(uint32_t)) {
-    uint32_t localTimeUnix;
-    memcpy(&localTimeUnix, incomingData, sizeof(localTimeUnix));
-
-    struct timeval now = {
-      .tv_sec = localTimeUnix,
-      .tv_usec = 0
-    };
-    settimeofday(&now, nullptr);
-
-    Serial.print("Time set from relay: ");
-    Serial.println(localTimeUnix);
-
-    hasTimeBeenSet = true;
-  }
-  if (len == 3 && memcmp(incomingData, "ACK", 3) == 0) {
-    gotAck = true;
-    Serial.println("Received ACK from relay!");
-    return;
-  }
-  // Per-batch ACK: "ACKB" + batch number (1 byte)
-  if (len == 5 && memcmp(incomingData, "ACKB", 4) == 0) {
-    gotBatchAck = true;
-    lastAckBatch = incomingData[4];
-    Serial.print("Received batch ACK for batch ");
-    Serial.println(lastAckBatch);
-    return;
-  }
-  if (len == 6 && memcmp(incomingData, "READY", 5) == 0) {
-    relayReady = true;
-    lastReadySeq = incomingData[5];
-    Serial.println("Received READY signal from relay!");
-    return;
-  }
-  if (len == 9 && memcmp(incomingData, "COMPLETE", 8) == 0) {
-    relayComplete = true;
-    lastCompleteSeq = incomingData[8];
-    Serial.println("Received COMPLETE signal from relay!");
-    return;
-  }
-}
-
-bool waitForComplete(uint8_t seq, uint32_t timeout_ms = 8000) {
-  relayComplete = false;
-  lastCompleteSeq = 0;
-  unsigned long start = millis();
-  while ((!relayComplete || lastCompleteSeq != lastReadySeq) && (millis() - start < timeout_ms)) {
-    delay(10);
-  }
-  return relayComplete && (lastCompleteSeq == lastReadySeq);
-}
-
-// Send data over ESP-NOW
-bool sendData(sensorReadings* data, int count) {
-  for (int i = 0; i < count; i++) {
-    esp_err_t result = esp_now_send(relayMAC, (uint8_t*)&data[i], sizeof(sensorReadings));
-    if (result != ESP_OK) {
-      return false;
-    }
-    delay(2);  // Delay helps reduce chance of drops
-  }
-  return true;
-}
-
-// Send handshake request
-bool sendHandshake() {
-  gotAck = false;
-  const char* helloMsg = "HELLO";
-  esp_now_send(relayMAC, (uint8_t*)helloMsg, strlen(helloMsg));
-  
-  unsigned long start = millis();
-  while (millis() - start < 200) {
-    if (gotAck) return true;
-    delay(10);
-  }
-  return false;
 }
 
 
@@ -243,7 +270,7 @@ void gotosleep() {
 
 void gotosleepfast() {
       //WiFi.disconnect();
-          esp_sleep_enable_timer_wakeup(1 * 1000000);
+          esp_sleep_enable_timer_wakeup(1 * 10000);
           esp_deep_sleep_start();
           delay(1000);
 }
@@ -256,58 +283,6 @@ void killwifi() {
 }
 
 
-
-bool waitForReady(uint32_t timeout_ms = 5000) {
-  relayReady = false;
-  requestSeq++;
-  // send REQUEST with requestSeq
-  uint8_t msg[8] = {'R','E','Q','U','E','S','T', requestSeq};
-  esp_now_send(relayMAC, msg, 8);
-
-  unsigned long start = millis();
-  while ((!relayReady || lastReadySeq != requestSeq) && (millis() - start < timeout_ms)) {
-    delay(10);
-  }
-  return relayReady && (lastReadySeq == requestSeq);
-}
-
-
-
-void transmitReadings() {
-  display.clearDisplay();   // clears the screen and buffer
-  display.setCursor(0,0);
-
-  if (readingCnt <= 0) return;
-
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.print("Waiting for relay ready...");
-  Serial.print("Waiting for relay ready...");
-  display.display();
-  
-  if (!waitForReady(8000)) {
-    display.clearDisplay();
-    display.setCursor(0,0);
-    display.print("Relay not ready, saving to NVS...");
-    Serial.print("Relay not ready, saving to NVS...");
-    display.display();
-    delay(1000);
-    return; // Don't send data if relay isn't ready
-  }
-  
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("Relay ready!");
-  Serial.println("Relay ready!");
-
-  display.print("TXing #");
-  Serial.print("TXing #");
-  display.println(arrayCnt);
-  Serial.println(arrayCnt);
-  display.display();
-
-  sendDataBatched(Readings, readingCnt);
-}
 
 
 float readChannel(ADS1115_MUX channel) {
@@ -381,21 +356,11 @@ void setup(void)
       initESPNOW();
       display.print("Connecting to get time...");
       display.display();
-      uint8_t dummy = 0;
-      esp_now_send(relayMAC, &dummy, sizeof(dummy));
 
-      if (!hasTimeBeenSet) {
-        display.println("Waiting for time from relay...");
-        display.display();
-        if (waitForTime(3000)) {
-          display.println("Time successfully set from relay");
-          display.display();
-        } else {
-          display.println("Timeout: did not receive time");
-          display.display();
-          // Optional: go to sleep or fail safe
-        }
-      }
+
+
+    Serial.println("Requesting time sync...");
+    requestTimeSync();
 
           //initTime("EST5EDT,M3.2.0,M11.1.0");
 
@@ -404,7 +369,7 @@ void setup(void)
           readingCnt = 0;
           delay(1);
 
-          esp_sleep_enable_timer_wakeup(1 * 1000000);
+          esp_sleep_enable_timer_wakeup(1 * 10000);
           esp_deep_sleep_start();
           delay(1000);
   }
@@ -528,9 +493,10 @@ void setup(void)
       Serial.println("Connecting to transmit...");
       display.display();
 
-
-      if (!sendHandshake()) {
-
+      if (transmitReadingsArray()) {
+        Serial.println("Data transmission successful");
+      } else {
+        Serial.println("Data transmission failed");
         delay(1);
         ++arrayCnt;
         delay(1);
@@ -539,46 +505,18 @@ void setup(void)
         killwifi();
         display.clearDisplay();   // clears the screen and buffer
         display.setCursor(0,0);
-        display.print("Timed out, saving to NVS...");
-        Serial.println("Timed out, saving to NVS...");
+        display.print("saving to NVS...");
+        Serial.println("saving to NVS...");
         display.display();
-        delay(3000);
+        delay(1000);
         esp_sleep_enable_timer_wakeup(1 * 1000000);
         esp_deep_sleep_start();
       }
-      display.clearDisplay();   // clears the screen and buffer
-      display.setCursor(0,0);
-      display.print("Connected. Transmitting #0");
-      Serial.println("Connected. Transmitting #0");
-      display.display();
-      transmitReadings();
-        if (!waitForComplete(requestSeq, 8000)) {
-          Serial.println("Did not receive COMPLETE from relay, aborting or retrying...");
-          // Handle error: retry, save to NVS, etc.
-          return;
-        }
-      delay(10);
+      
       while (arrayCnt > 0) {
-        display.clearDisplay();
-        display.setCursor(0,0);
-        display.print("Waiting for relay ready...");
-        Serial.println("Waiting for relay ready...");
-        display.display();
-        
-        if (!waitForReady(8000)) {
-          display.clearDisplay();
-          display.setCursor(0,0);
-          Serial.println("Relay not ready, saving to NVS...");
-          display.print("Relay not ready, saving to NVS...");
-          display.display();
-          delay(3000);
-          break; // Don't send data if relay isn't ready
-        }
         delay(10);
         display.clearDisplay();
         display.setCursor(0,0);
-        display.println("Relay ready!");
-        Serial.println("Relay ready!");
         display.print("TXing #");
         Serial.print("TXing #");
         display.println(arrayCnt - 1);
@@ -586,20 +524,22 @@ void setup(void)
         display.display();
         //delay(50);
         prefs.getBytes(String(arrayCnt).c_str(), &Readings, sizeof(Readings));
-        sendDataBatched(Readings, maximumReadings);
-        if (!waitForComplete(requestSeq, 8000)) {
-          Serial.println("Did not receive COMPLETE from relay, aborting or retrying...");
-          // Handle error: retry, save to NVS, etc.
-          return;
-        }  
+      if (transmitReadingsArray()) {
+        Serial.println("Data transmission of array " + String(arrayCnt - 1) + " successful");
+      } else {
+        Serial.println("Data transmission of array " + String(arrayCnt - 1) + " failed");
+        return;
+      }
         arrayCnt--;
         
       }
+      delay(500);
+      requestTimeSync();
       arrayCnt = 0;
-      readingCnt = -1;
+      readingCnt = 0;
       delay(1);
       arrayCnt = 0;
-      readingCnt = -1;
+      readingCnt = 0;
       delay(1);
       lastReadySeq = 0;
       lastCompleteSeq = 0;
@@ -612,7 +552,10 @@ void setup(void)
 
 
 
-      ESP.restart();
+      
+          esp_sleep_enable_timer_wakeup(1 * 10000);
+          esp_deep_sleep_start();
+          delay(1000);
   } 
 
 
